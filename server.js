@@ -189,6 +189,26 @@ app.post('/verify', async (req, res) => {
   });
 });
 
+// ── VERSION CHECK (called by desktop app on startup) ────────────────────────
+// GET /version-check
+// Railway env vars:
+//   REQUIRED_VERSION   → e.g. "8.3.0" — any build older than this sees the update wall
+//   UPDATE_URL         → direct download link or Discord invite
+//   UPDATE_MESSAGE     → headline shown on the update screen
+//   UPDATE_CHANGE_NOTE → optional detail line (e.g. "Fixed exploit in inject engine")
+//
+// To force all 8.2.0 users to update right now:
+//   Set REQUIRED_VERSION = 8.3.0 in Railway Variables and save.
+//   Every user gets the update wall on next app launch. No bypass.
+app.get('/version-check', (req, res) => {
+  res.json({
+    required_version: process.env.REQUIRED_VERSION   || '1.0.0',
+    update_url:       process.env.UPDATE_URL         || 'https://discord.gg/WcZwrqytTy',
+    message:          process.env.UPDATE_MESSAGE     || 'A new required update is available. Please download the latest version to continue.',
+    change_note:      process.env.UPDATE_CHANGE_NOTE || null,
+  });
+});
+
 // ── STATUS (public health check) ────────────────────────────────────────────
 app.get('/status', (_req, res) => {
   res.json({ status: 'ok', version: '1.0.0', timestamp: new Date() });
