@@ -13,6 +13,7 @@ app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '1mb' }));
 
 const MAX_ADMIN_GENERATE = 500;
+const LOOTLAB_REQUIRE_API = String(process.env.LOOTLAB_REQUIRE_API || 'true').toLowerCase() !== 'false';
 const LOOTLAB_REWARD_MS = Math.max(1000, Number(process.env.LOOTLAB_REWARD_HOURS || 12) * 60 * 60 * 1000);
 const PUBLIC_URL = (process.env.PUBLIC_URL || process.env.API_PUBLIC_URL || process.env.RAILWAY_PUBLIC_DOMAIN || '').replace(/\/$/, '');
 
@@ -182,34 +183,90 @@ async function insertGeneratedKey(type, durationMs, generatedBy, generatedByTag)
   return key;
 }
 
-async function createLootLabsLink(destinationUrl) {
-  const apiToken = process.env.LOOTLAB_API_TOKEN || '';
-  if (!apiToken) return { loot_url: null, raw: null };
+async function readLootLabsResponse(response) {
+  const text = await response.text();
+  let data = {};
+  try {
+    data = text ? JSON.parse(text) : {};
+  } catch {
+    data = { raw: text };
+  }
+  return data;
+}
 
+function lootLabsUrlFromResponse(data) {
+  return data?.message?.loot_url || data?.loot_url || data?.message?.short_url || data?.short_url || null;
+}
+
+function buildLootLabsPayload(destinationUrl) {
+  const title = String(process.env.LOOTLAB_TITLE || 'ET Sniper 12 Hour Key').trim().slice(0, 60) || 'ET Sniper 12 Hour Key';
+  const tierId = Number(process.env.LOOTLAB_TIER_ID || 1);
+  const tasks = Number(process.env.LOOTLAB_NUMBER_OF_TASKS || 3);
+  const theme = Number(process.env.LOOTLAB_THEME || 1);
   const body = {
-    title: String(process.env.LOOTLAB_TITLE || 'ET Sniper 12 Hour Key').slice(0, 30),
+    title,
     url: destinationUrl,
-    tier_id: Number(process.env.LOOTLAB_TIER_ID || 1),
-    number_of_tasks: Number(process.env.LOOTLAB_NUMBER_OF_TASKS || 3),
-    theme: Number(process.env.LOOTLAB_THEME || 1),
+    tier_id: Number.isFinite(tierId) ? tierId : 1,
+    number_of_tasks: Number.isFinite(tasks) ? Math.min(5, Math.max(1, tasks)) : 3,
+    theme: Number.isFinite(theme) ? theme : 1,
   };
-  if (process.env.LOOTLAB_THUMBNAIL) body.thumbnail = process.env.LOOTLAB_THUMBNAIL;
+  const thumbnail = String(process.env.LOOTLAB_THUMBNAIL || '').trim();
+  if (thumbnail && /^https?:\/\//i.test(thumbnail)) body.thumbnail = thumbnail;
+  return body;
+}
 
-  const response = await fetch('https://creators.lootlabs.gg/api/public/content_locker', {
+async function createLootLabsLink(destinationUrl) {
+  const apiToken = String(process.env.LOOTLAB_API_TOKEN || '').trim();
+  if (!apiToken) throw new Error('LOOTLAB_API_TOKEN is missing on the backend service');
+  if (!/^https?:\/\//i.test(destinationUrl)) throw new Error('PUBLIC_URL must be a public http/https URL');
+
+  const endpoint = 'https://creators.lootlabs.gg/api/public/content_locker';
+  const body = buildLootLabsPayload(destinationUrl);
+  const safeLog = { ...body, url: destinationUrl, token_set: true };
+  console.log('[LootLabs] Creating locked link:', safeLog);
+
+  const postResponse = await fetch(endpoint, {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${apiToken}`,
       'Content-Type': 'application/json',
+      Accept: 'application/json',
+      'User-Agent': 'ET-Sniper-Backend/2.4.6',
     },
     body: JSON.stringify(body),
   });
 
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok || data.type === 'error') {
-    throw new Error(data.message || `LootLabs HTTP ${response.status}`);
+  const postData = await readLootLabsResponse(postResponse);
+  console.log('[LootLabs] POST response:', { status: postResponse.status, type: postData?.type, message: typeof postData?.message === 'string' ? postData.message : postData?.message });
+
+  if (postResponse.ok && postData?.type !== 'error') {
+    const lootUrl = lootLabsUrlFromResponse(postData);
+    if (lootUrl) return { loot_url: lootUrl, raw: postData, method: 'POST' };
   }
 
-  return { loot_url: data.message?.loot_url || data.loot_url || null, raw: data };
+  const params = new URLSearchParams();
+  params.set('api_token', apiToken);
+  for (const [key, value] of Object.entries(body)) params.set(key, String(value));
+
+  const getResponse = await fetch(`${endpoint}?${params.toString()}`, {
+    method: 'GET',
+    headers: {
+      Accept: 'application/json',
+      'User-Agent': 'ET-Sniper-Backend/2.4.6',
+    },
+  });
+
+  const getData = await readLootLabsResponse(getResponse);
+  console.log('[LootLabs] GET fallback response:', { status: getResponse.status, type: getData?.type, message: typeof getData?.message === 'string' ? getData.message : getData?.message });
+
+  if (getResponse.ok && getData?.type !== 'error') {
+    const lootUrl = lootLabsUrlFromResponse(getData);
+    if (lootUrl) return { loot_url: lootUrl, raw: getData, method: 'GET' };
+  }
+
+  const postMessage = typeof postData?.message === 'string' ? postData.message : JSON.stringify(postData?.message || postData || {});
+  const getMessage = typeof getData?.message === 'string' ? getData.message : JSON.stringify(getData?.message || getData || {});
+  throw new Error(`LootLabs create failed. POST ${postResponse.status}: ${postMessage}; GET ${getResponse.status}: ${getMessage}`);
 }
 
 function adminAuth(req, res, next) {
@@ -294,7 +351,7 @@ async function initDB() {
 }
 
 app.get('/', (_req, res) => {
-  res.json({ status: 'ok', name: 'ET Sniper Backend', version: '2.4.0' });
+  res.json({ status: 'ok', name: 'ET Sniper Backend', version: '2.4.6', lootlabs_required: LOOTLAB_REQUIRE_API });
 });
 
 app.post(['/admin/keys/generate', '/admin/keys/generate-custom', '/admin/generate-keys'], adminAuth, async (req, res) => {
@@ -557,15 +614,22 @@ app.post('/admin/lootlab/start', adminAuth, async (req, res) => {
   const base = getPublicBaseUrl(req);
   const destinationUrl = `${base}/lootlab/complete?token=${encodeURIComponent(token)}`;
 
-  let lootUrl = null;
+  let created;
   try {
-    const created = await createLootLabsLink(destinationUrl);
-    lootUrl = created.loot_url;
+    created = await createLootLabsLink(destinationUrl);
   } catch (err) {
-    console.error('[LootLabs] create link failed:', err.message);
-    if (String(process.env.LOOTLAB_REQUIRE_API || '').toLowerCase() === 'true') {
-      return res.status(502).json({ error: `LootLabs link create failed: ${err.message}` });
-    }
+    console.error('[LootLabs] Link create failed:', err.message);
+    return res.status(502).json({
+      error: err.message,
+      lootlabs_configured: Boolean(process.env.LOOTLAB_API_TOKEN),
+      public_url: base,
+      fix: 'Check LOOTLAB_API_TOKEN, PUBLIC_URL, LOOTLAB_TIER_ID, LOOTLAB_NUMBER_OF_TASKS, and required Creator Details in LootLabs.',
+    });
+  }
+
+  const lootUrl = created.loot_url;
+  if (!lootUrl || !/^https?:\/\//i.test(lootUrl)) {
+    return res.status(502).json({ error: 'LootLabs did not return a valid loot_url', method: created.method || null });
   }
 
   await pool.query(
@@ -574,13 +638,29 @@ app.post('/admin/lootlab/start', adminAuth, async (req, res) => {
     [token, discordId, req.body.username || null, req.body.tag || null, destinationUrl, lootUrl]
   );
 
+  console.log('[LootLabs] Created locked reward link:', { discord_id: discordId, method: created.method, loot_url: lootUrl });
+
   res.json({
     success: true,
     token,
-    destination_url: destinationUrl,
-    loot_url: lootUrl || destinationUrl,
-    using_lootlabs_api: Boolean(lootUrl),
-    reward: '12 hour key',
+    loot_url: lootUrl,
+    using_lootlabs_api: true,
+    method: created.method || 'unknown',
+    reward: `${Number(process.env.LOOTLAB_REWARD_HOURS || 12)} hour key`,
+  });
+});
+
+app.get('/admin/lootlab/config', adminAuth, (req, res) => {
+  res.json({
+    version: '2.4.6',
+    lootlabs_configured: Boolean(process.env.LOOTLAB_API_TOKEN),
+    lootlabs_required: LOOTLAB_REQUIRE_API,
+    public_url: getPublicBaseUrl(req),
+    title: process.env.LOOTLAB_TITLE || 'ET Sniper 12 Hour Key',
+    tier_id: Number(process.env.LOOTLAB_TIER_ID || 1),
+    number_of_tasks: Number(process.env.LOOTLAB_NUMBER_OF_TASKS || 3),
+    theme: Number(process.env.LOOTLAB_THEME || 1),
+    reward_hours: Number(process.env.LOOTLAB_REWARD_HOURS || 12),
   });
 });
 
@@ -656,7 +736,7 @@ app.get('/version-check', (_req, res) => {
 });
 
 app.get('/status', (_req, res) => {
-  res.json({ status: 'ok', version: '2.4.0', timestamp: new Date() });
+  res.json({ status: 'ok', version: '2.4.6', lootlabs_required: LOOTLAB_REQUIRE_API, timestamp: new Date() });
 });
 
 app.get('/admin/stats', adminAuth, async (_req, res) => {
@@ -684,7 +764,10 @@ app.use((req, res) => {
 
 const PORT = process.env.PORT || 3000;
 initDB().then(() => {
-  app.listen(PORT, () => console.log(`[Server] Running on port ${PORT}`));
+  app.listen(PORT, () => {
+    console.log(`[Server] Running on port ${PORT}`);
+    console.log('[LootLabs] Config:', { token_set: Boolean(process.env.LOOTLAB_API_TOKEN), require_api: LOOTLAB_REQUIRE_API, public_url: PUBLIC_URL || '(auto)', tier_id: process.env.LOOTLAB_TIER_ID || '1', tasks: process.env.LOOTLAB_NUMBER_OF_TASKS || '3' });
+  });
 }).catch(err => {
   console.error('[Server] DB init failed:', err);
   process.exit(1);
