@@ -13,6 +13,18 @@ app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '1mb' }));
 
 const MAX_ADMIN_GENERATE = 500;
+const LOOTLAB_REWARD_MS = Math.max(1000, Number(process.env.LOOTLAB_REWARD_HOURS || 12) * 60 * 60 * 1000);
+const PUBLIC_URL = (process.env.PUBLIC_URL || process.env.API_PUBLIC_URL || process.env.RAILWAY_PUBLIC_DOMAIN || '').replace(/\/$/, '');
+
+function getPublicBaseUrl(req) {
+  if (PUBLIC_URL) {
+    if (PUBLIC_URL.startsWith('http://') || PUBLIC_URL.startsWith('https://')) return PUBLIC_URL;
+    return `https://${PUBLIC_URL}`;
+  }
+  const proto = req.headers['x-forwarded-proto'] || req.protocol || 'https';
+  return `${proto}://${req.get('host')}`;
+}
+
 
 function normalizeKeyType(input) {
   const raw = String(input || '').trim().toLowerCase();
@@ -153,6 +165,53 @@ function makeKey(type) {
   return `ET-${prefix}-${crypto.randomBytes(5).toString('hex').toUpperCase()}`;
 }
 
+async function insertGeneratedKey(type, durationMs, generatedBy, generatedByTag) {
+  let key = makeKey(type);
+  for (let tries = 0; tries < 8; tries++) {
+    try {
+      await pool.query(
+        'INSERT INTO keys (key, type, duration_ms, generated_by, generated_by_tag) VALUES ($1, $2, $3, $4, $5)',
+        [key, type, durationMs, generatedBy || null, generatedByTag || null]
+      );
+      return key;
+    } catch (err) {
+      if (err.code !== '23505' || tries === 7) throw err;
+      key = makeKey(type);
+    }
+  }
+  return key;
+}
+
+async function createLootLabsLink(destinationUrl) {
+  const apiToken = process.env.LOOTLAB_API_TOKEN || '';
+  if (!apiToken) return { loot_url: null, raw: null };
+
+  const body = {
+    title: String(process.env.LOOTLAB_TITLE || 'ET Sniper 12 Hour Key').slice(0, 30),
+    url: destinationUrl,
+    tier_id: Number(process.env.LOOTLAB_TIER_ID || 1),
+    number_of_tasks: Number(process.env.LOOTLAB_NUMBER_OF_TASKS || 3),
+    theme: Number(process.env.LOOTLAB_THEME || 1),
+  };
+  if (process.env.LOOTLAB_THUMBNAIL) body.thumbnail = process.env.LOOTLAB_THUMBNAIL;
+
+  const response = await fetch('https://creators.lootlabs.gg/api/public/content_locker', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${apiToken}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(body),
+  });
+
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok || data.type === 'error') {
+    throw new Error(data.message || `LootLabs HTTP ${response.status}`);
+  }
+
+  return { loot_url: data.message?.loot_url || data.loot_url || null, raw: data };
+}
+
 function adminAuth(req, res, next) {
   const token = req.headers['x-admin-token'];
   if (!token || token !== process.env.ADMIN_TOKEN) return res.status(401).json({ error: 'Unauthorized' });
@@ -182,6 +241,22 @@ async function initDB() {
       expires_at TIMESTAMPTZ,
       last_seen TIMESTAMPTZ DEFAULT NOW()
     );
+
+    CREATE TABLE IF NOT EXISTS lootlab_rewards (
+      id SERIAL PRIMARY KEY,
+      token TEXT UNIQUE NOT NULL,
+      discord_id TEXT NOT NULL,
+      username TEXT,
+      tag TEXT,
+      status TEXT NOT NULL DEFAULT 'pending',
+      destination_url TEXT,
+      loot_url TEXT,
+      key TEXT REFERENCES keys(key),
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      completed_at TIMESTAMPTZ,
+      delivered_at TIMESTAMPTZ,
+      delivery_error TEXT
+    );
   `);
 
   await pool.query(`ALTER TABLE keys ADD COLUMN IF NOT EXISTS redeemed_at TIMESTAMPTZ`);
@@ -189,6 +264,28 @@ async function initDB() {
   await pool.query(`ALTER TABLE keys ADD COLUMN IF NOT EXISTS revoked BOOLEAN DEFAULT FALSE`);
   await pool.query(`ALTER TABLE keys ADD COLUMN IF NOT EXISTS generated_by TEXT`);
   await pool.query(`ALTER TABLE keys ADD COLUMN IF NOT EXISTS generated_by_tag TEXT`);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS lootlab_rewards (
+      id SERIAL PRIMARY KEY,
+      token TEXT UNIQUE NOT NULL,
+      discord_id TEXT NOT NULL,
+      username TEXT,
+      tag TEXT,
+      status TEXT NOT NULL DEFAULT 'pending',
+      destination_url TEXT,
+      loot_url TEXT,
+      key TEXT REFERENCES keys(key),
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      completed_at TIMESTAMPTZ,
+      delivered_at TIMESTAMPTZ,
+      delivery_error TEXT
+    )
+  `);
+  await pool.query(`ALTER TABLE lootlab_rewards ADD COLUMN IF NOT EXISTS destination_url TEXT`);
+  await pool.query(`ALTER TABLE lootlab_rewards ADD COLUMN IF NOT EXISTS loot_url TEXT`);
+  await pool.query(`ALTER TABLE lootlab_rewards ADD COLUMN IF NOT EXISTS key TEXT REFERENCES keys(key)`);
+  await pool.query(`ALTER TABLE lootlab_rewards ADD COLUMN IF NOT EXISTS delivered_at TIMESTAMPTZ`);
+  await pool.query(`ALTER TABLE lootlab_rewards ADD COLUMN IF NOT EXISTS delivery_error TEXT`);
   await pool.query(`ALTER TABLE keys ALTER COLUMN duration_ms SET DEFAULT 0`);
   await pool.query(`UPDATE keys SET duration_ms = 0 WHERE duration_ms IS NULL`);
   await pool.query(`ALTER TABLE keys ALTER COLUMN duration_ms SET NOT NULL`);
@@ -197,7 +294,7 @@ async function initDB() {
 }
 
 app.get('/', (_req, res) => {
-  res.json({ status: 'ok', name: 'ET Sniper Backend', version: '2.3.0' });
+  res.json({ status: 'ok', name: 'ET Sniper Backend', version: '2.4.0' });
 });
 
 app.post(['/admin/keys/generate', '/admin/keys/generate-custom', '/admin/generate-keys'], adminAuth, async (req, res) => {
@@ -211,20 +308,8 @@ app.post(['/admin/keys/generate', '/admin/keys/generate-custom', '/admin/generat
 
   const generated = [];
   for (let i = 0; i < amount; i++) {
-    let key = makeKey(duration.type);
-    for (let tries = 0; tries < 5; tries++) {
-      try {
-        await pool.query(
-          'INSERT INTO keys (key, type, duration_ms, generated_by, generated_by_tag) VALUES ($1, $2, $3, $4, $5)',
-          [key, duration.type, duration.durationMs, req.body.generated_by || null, req.body.generated_by_tag || null]
-        );
-        generated.push(key);
-        break;
-      } catch (err) {
-        if (err.code !== '23505' || tries === 4) throw err;
-        key = makeKey(duration.type);
-      }
-    }
+    const key = await insertGeneratedKey(duration.type, duration.durationMs, req.body.generated_by || null, req.body.generated_by_tag || null);
+    generated.push(key);
   }
 
   res.json({
@@ -463,6 +548,104 @@ app.post('/verify', async (req, res) => {
   });
 });
 
+
+app.post('/admin/lootlab/start', adminAuth, async (req, res) => {
+  const discordId = String(req.body.discord_id || '').trim();
+  if (!discordId) return res.status(400).json({ error: 'Missing discord_id' });
+
+  const token = crypto.randomBytes(24).toString('hex');
+  const base = getPublicBaseUrl(req);
+  const destinationUrl = `${base}/lootlab/complete?token=${encodeURIComponent(token)}`;
+
+  let lootUrl = null;
+  try {
+    const created = await createLootLabsLink(destinationUrl);
+    lootUrl = created.loot_url;
+  } catch (err) {
+    console.error('[LootLabs] create link failed:', err.message);
+    if (String(process.env.LOOTLAB_REQUIRE_API || '').toLowerCase() === 'true') {
+      return res.status(502).json({ error: `LootLabs link create failed: ${err.message}` });
+    }
+  }
+
+  await pool.query(
+    `INSERT INTO lootlab_rewards (token, discord_id, username, tag, status, destination_url, loot_url)
+     VALUES ($1, $2, $3, $4, 'pending', $5, $6)`,
+    [token, discordId, req.body.username || null, req.body.tag || null, destinationUrl, lootUrl]
+  );
+
+  res.json({
+    success: true,
+    token,
+    destination_url: destinationUrl,
+    loot_url: lootUrl || destinationUrl,
+    using_lootlabs_api: Boolean(lootUrl),
+    reward: '12 hour key',
+  });
+});
+
+app.get('/lootlab/complete', async (req, res) => {
+  const token = String(req.query.token || '').trim();
+  if (!token) return res.status(400).send('Missing reward token.');
+
+  const rewardRow = await pool.query('SELECT * FROM lootlab_rewards WHERE token = $1', [token]);
+  if (!rewardRow.rows.length) return res.status(404).send('Invalid or expired reward link.');
+
+  const reward = rewardRow.rows[0];
+  if (reward.status === 'completed' && reward.key) {
+    return res.send(`<!doctype html><html><head><title>ET Sniper Reward</title><style>body{font-family:Arial;background:#08111f;color:#e5f2ff;display:grid;place-items:center;min-height:100vh;margin:0}.card{max-width:520px;padding:28px;border:1px solid #1e3a5f;border-radius:18px;background:#0d1728;text-align:center}h1{color:#34d399}.small{color:#8ba5c4}</style></head><body><div class="card"><h1>Reward already completed</h1><p>Your 12 hour key was already generated. Check your Discord DMs.</p><p class="small">You can close this page.</p></div></body></html>`);
+  }
+
+  const key = await insertGeneratedKey('hour', LOOTLAB_REWARD_MS, 'lootlab', `LootLabs reward for ${reward.discord_id}`);
+  await pool.query(
+    `UPDATE lootlab_rewards
+     SET status = 'completed', key = $1, completed_at = NOW(), delivery_error = NULL
+     WHERE token = $2`,
+    [key, token]
+  );
+
+  res.send(`<!doctype html><html><head><title>ET Sniper Reward</title><style>body{font-family:Arial;background:#08111f;color:#e5f2ff;display:grid;place-items:center;min-height:100vh;margin:0}.card{max-width:520px;padding:28px;border:1px solid #1e3a5f;border-radius:18px;background:#0d1728;text-align:center}h1{color:#34d399}.key{font-family:monospace;background:#111f33;padding:10px 12px;border-radius:10px;color:#93c5fd}.small{color:#8ba5c4}</style></head><body><div class="card"><h1>✅ Reward completed</h1><p>Your 12 hour ET Sniper key was generated.</p><p class="key">${key}</p><p class="small">The Discord bot will DM this key to you. Then run /redeem with it.</p></div></body></html>`);
+});
+
+app.get('/admin/lootlab/completed', adminAuth, async (req, res) => {
+  const limit = Math.min(50, Math.max(1, Number(req.query.limit) || 25));
+  const { rows } = await pool.query(
+    `SELECT id, discord_id, username, tag, key, completed_at
+     FROM lootlab_rewards
+     WHERE status = 'completed' AND key IS NOT NULL AND delivered_at IS NULL
+     ORDER BY completed_at ASC
+     LIMIT $1`,
+    [limit]
+  );
+  res.json({ rewards: rows });
+});
+
+app.post('/admin/lootlab/:id/delivered', adminAuth, async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'Invalid reward id' });
+  const delivered = req.body.delivered !== false;
+  const error = req.body.error ? String(req.body.error).slice(0, 500) : null;
+  const result = await pool.query(
+    delivered
+      ? `UPDATE lootlab_rewards SET delivered_at = NOW(), delivery_error = NULL WHERE id = $1`
+      : `UPDATE lootlab_rewards SET delivery_error = $2 WHERE id = $1`,
+    delivered ? [id] : [id, error]
+  );
+  res.json({ success: result.rowCount > 0 });
+});
+
+app.get('/admin/lootlab/status/:discord_id', adminAuth, async (req, res) => {
+  const { rows } = await pool.query(
+    `SELECT id, status, key, created_at, completed_at, delivered_at, delivery_error, loot_url
+     FROM lootlab_rewards
+     WHERE discord_id = $1
+     ORDER BY created_at DESC
+     LIMIT 10`,
+    [req.params.discord_id]
+  );
+  res.json({ rewards: rows });
+});
+
 app.get('/version-check', (_req, res) => {
   res.json({
     required_version: process.env.REQUIRED_VERSION || '1.0.0',
@@ -473,7 +656,7 @@ app.get('/version-check', (_req, res) => {
 });
 
 app.get('/status', (_req, res) => {
-  res.json({ status: 'ok', version: '2.3.0', timestamp: new Date() });
+  res.json({ status: 'ok', version: '2.4.0', timestamp: new Date() });
 });
 
 app.get('/admin/stats', adminAuth, async (_req, res) => {
