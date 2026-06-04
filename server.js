@@ -195,7 +195,39 @@ async function readLootLabsResponse(response) {
 }
 
 function lootLabsUrlFromResponse(data) {
-  return data?.message?.loot_url || data?.loot_url || data?.message?.short_url || data?.short_url || null;
+  const pick = (item) => {
+    if (!item || typeof item !== 'object') return null;
+    return item.loot_url || item.short_url || item.short || item.url || item.link || null;
+  };
+
+  if (Array.isArray(data)) {
+    for (const item of data) {
+      const url = pick(item);
+      if (url) return url;
+    }
+  }
+
+  if (Array.isArray(data?.message)) {
+    for (const item of data.message) {
+      const url = pick(item);
+      if (url) return url;
+    }
+  }
+
+  if (Array.isArray(data?.data)) {
+    for (const item of data.data) {
+      const url = pick(item);
+      if (url) return url;
+    }
+  }
+
+  return (
+    pick(data) ||
+    pick(data?.message) ||
+    pick(data?.data) ||
+    pick(data?.result) ||
+    null
+  );
 }
 
 function buildLootLabsPayload(destinationUrl) {
@@ -231,7 +263,7 @@ async function createLootLabsLink(destinationUrl) {
       Authorization: `Bearer ${apiToken}`,
       'Content-Type': 'application/json',
       Accept: 'application/json',
-      'User-Agent': 'ET-Sniper-Backend/2.4.6',
+      'User-Agent': 'ET-Sniper-Backend/2.4.7',
     },
     body: JSON.stringify(body),
   });
@@ -252,7 +284,7 @@ async function createLootLabsLink(destinationUrl) {
     method: 'GET',
     headers: {
       Accept: 'application/json',
-      'User-Agent': 'ET-Sniper-Backend/2.4.6',
+      'User-Agent': 'ET-Sniper-Backend/2.4.7',
     },
   });
 
@@ -351,7 +383,7 @@ async function initDB() {
 }
 
 app.get('/', (_req, res) => {
-  res.json({ status: 'ok', name: 'ET Sniper Backend', version: '2.4.6', lootlabs_required: LOOTLAB_REQUIRE_API });
+  res.json({ status: 'ok', name: 'ET Sniper Backend', version: '2.4.7', lootlabs_required: LOOTLAB_REQUIRE_API });
 });
 
 app.post(['/admin/keys/generate', '/admin/keys/generate-custom', '/admin/generate-keys'], adminAuth, async (req, res) => {
@@ -652,7 +684,7 @@ app.post('/admin/lootlab/start', adminAuth, async (req, res) => {
 
 app.get('/admin/lootlab/config', adminAuth, (req, res) => {
   res.json({
-    version: '2.4.6',
+    version: '2.4.7',
     lootlabs_configured: Boolean(process.env.LOOTLAB_API_TOKEN),
     lootlabs_required: LOOTLAB_REQUIRE_API,
     public_url: getPublicBaseUrl(req),
@@ -736,7 +768,7 @@ app.get('/version-check', (_req, res) => {
 });
 
 app.get('/status', (_req, res) => {
-  res.json({ status: 'ok', version: '2.4.6', lootlabs_required: LOOTLAB_REQUIRE_API, timestamp: new Date() });
+  res.json({ status: 'ok', version: '2.4.7', lootlabs_required: LOOTLAB_REQUIRE_API, timestamp: new Date() });
 });
 
 app.get('/admin/stats', adminAuth, async (_req, res) => {
